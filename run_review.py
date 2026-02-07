@@ -47,7 +47,7 @@ def run_review(
     repo_dir: str,
     head_sha: str | None = None,
 ):
-    repo_path = os.path.join(repo_dir, repo.replace("/", "_"))
+    repo_path = os.path.abspath(os.path.join(repo_dir, repo.replace("/", "_")))
     worktree_name = f"pr-{pr_number}"
     worktree_path = os.path.join(repo_path, "worktrees", worktree_name)
 
@@ -58,7 +58,7 @@ def run_review(
 
     try:
         # 1. Fetch latest changes
-        run(["git", "fetch", "origin", "--prune"], cwd=repo_path)
+        run(["git", "pull", "--all"], cwd=repo_path)
 
         # 2. Clean up stale worktree if it exists
         if os.path.exists(worktree_path):
