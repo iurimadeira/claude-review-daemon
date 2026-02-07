@@ -1,0 +1,24 @@
+# Claude CI Bridge Configuration
+# Copy to config.toml and customize for your setup.
+
+[polling]
+interval_seconds = 300      # 5 minutes between polls
+max_concurrent_reviews = 3  # Max simultaneous review processes
+
+[paths]
+state_file = "./state.json"
+repo_dir = "./repos"
+
+# Add repositories to monitor. Each [[repos]] block defines one repository.
+# The bridge will poll for open PRs and trigger reviews when new commits appear.
+
+[[repos]]
+name = "owner/repo-name"    # GitHub repository (owner/repo format)
+skill = "review-pr"         # Skill file to use (from .claude/commands/<skill>.md)
+branches = ["main"]         # Only review PRs targeting these branches (optional)
+enabled = true              # Set to false to temporarily disable
+
+[[repos]]
+name = "another-owner/another-repo"
+# skill defaults to "review-pr" if not specified
+# branches omitted = review PRs targeting any branch

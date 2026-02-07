@@ -1,0 +1,25 @@
+[Unit]
+Description=Claude CI Bridge - Polling daemon for Claude Max PR reviews
+After=network.target
+
+[Service]
+Type=simple
+User=reviewer
+WorkingDirectory=/opt/claude-ci-bridge
+ExecStart=/usr/bin/python3 /opt/claude-ci-bridge/bridge.py
+Restart=always
+RestartSec=5
+
+# Graceful shutdown: wait for active reviews to complete
+TimeoutStopSec=300
+KillSignal=SIGTERM
+
+# Environment
+EnvironmentFile=/opt/claude-ci-bridge/.env
+Environment=CONFIG_FILE=/opt/claude-ci-bridge/config.toml
+
+# Ensure Max subscription is used, not API key
+Environment=ANTHROPIC_API_KEY=
+
+[Install]
+WantedBy=multi-user.target
