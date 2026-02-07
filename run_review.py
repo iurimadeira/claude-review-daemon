@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Review execution logic for Claude CI Bridge.
+"""Review execution logic for Claude Review Daemon.
 
 Manages git worktrees, runs Claude with skill injection, and posts
 results back to GitHub as PR comments.
 """
 
 import argparse
+import json
 import logging
 import os
 import subprocess
 import sys
 import textwrap
 from datetime import datetime, timezone
+
+from slack_notify import notify_review_posted
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +24,7 @@ logging.basicConfig(
 log = logging.getLogger("run-review")
 
 MAX_COMMENT_LENGTH = 65000  # GitHub comment limit is 65536
-COMMENT_MARKER_TEMPLATE = "<!-- claude-ci-bridge:{skill} -->"
+COMMENT_MARKER_TEMPLATE = "<!-- claude-review-daemon:{skill} -->"
 
 
 def run(cmd: list[str], cwd: str | None = None, capture: bool = False) -> subprocess.CompletedProcess:
@@ -73,7 +76,7 @@ def run_review(
         if not os.path.isfile(skill_path):
             error_msg = f"Skill file not found: `.claude/commands/{skill}.md`"
             log.error(error_msg)
-            upsert_comment(repo, pr_number, f"**Claude CI Bridge Error**\n\n{error_msg}", skill, head_sha)
+            upsert_comment(repo, pr_number, f"**Claude Review Daemon Error**\n\n{error_msg}", skill, head_sha)
             return
 
         with open(skill_path) as f:
@@ -113,7 +116,8 @@ def run_review(
             output = "Review completed but produced no output."
 
         # 6. Post result as PR comment
-        upsert_comment(repo, pr_number, output, skill, head_sha)
+        comment_url = upsert_comment(repo, pr_number, output, skill, head_sha)
+        notify_review_posted(repo, pr_number, output, comment_url)
 
         log.info("Review complete for %s#%d", repo, pr_number)
 
@@ -121,14 +125,14 @@ def run_review(
         log.error("Review timed out for %s#%d", repo, pr_number)
         upsert_comment(
             repo, pr_number,
-            "**Claude CI Bridge Error**\n\nReview timed out after 1 hour.",
+            "**Claude Review Daemon Error**\n\nReview timed out after 1 hour.",
             skill, head_sha,
         )
     except Exception as e:
         log.exception("Review failed for %s#%d: %s", repo, pr_number, e)
         upsert_comment(
             repo, pr_number,
-            f"**Claude CI Bridge Error**\n\nReview failed: {type(e).__name__}",
+            f"**Claude Review Daemon Error**\n\nReview failed: {type(e).__name__}",
             skill, head_sha,
         )
     finally:
@@ -177,7 +181,7 @@ def upsert_comment(
     body: str,
     skill: str,
     head_sha: str | None = None,
-):
+) -> str | None:
     marker = COMMENT_MARKER_TEMPLATE.format(skill=skill)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     footer_parts = []
@@ -204,13 +208,16 @@ def upsert_comment(
         )
         if result.returncode == 0:
             log.info("Comment updated successfully")
-            return
+            try:
+                return json.loads(result.stdout).get("html_url")
+            except (json.JSONDecodeError, AttributeError):
+                return None
         log.warning("Failed to update comment %d: %s — falling back to create", existing_id, result.stderr)
 
-    _create_comment(repo, pr_number, full_body)
+    return _create_comment(repo, pr_number, full_body)
 
 
-def _create_comment(repo: str, pr_number: int, body: str):
+def _create_comment(repo: str, pr_number: int, body: str) -> str | None:
     log.info("Creating comment on %s#%d (%d chars)", repo, pr_number, len(body))
     result = subprocess.run(
         [
@@ -224,8 +231,10 @@ def _create_comment(repo: str, pr_number: int, body: str):
     )
     if result.returncode != 0:
         log.error("Failed to create comment: %s", result.stderr)
-    else:
-        log.info("Comment created successfully")
+        return None
+    log.info("Comment created successfully")
+    url = result.stdout.strip()
+    return url if url.startswith("http") else None
 
 
 def main():

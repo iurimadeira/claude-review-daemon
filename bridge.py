@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude CI Bridge - Polling daemon for Claude Max PR reviews.
+"""Claude Review Daemon - Polling daemon for Claude Max PR reviews.
 
 A standalone daemon that polls GitHub for open PRs, tracks reviewed commits
 in a state file, and triggers Claude reviews when PR heads change.
@@ -29,7 +29,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("claude-ci-bridge")
+log = logging.getLogger("claude-review-daemon")
 
 GITHUB_API = "https://api.github.com"
 STATE_VERSION = 1
@@ -328,7 +328,7 @@ class Daemon:
         self.state.cleanup_closed_prs(repo, open_pr_numbers)
 
     def run(self):
-        log.info("Claude CI Bridge daemon starting")
+        log.info("Claude Review Daemon starting")
         log.info("Polling interval: %d seconds", self.config.interval_seconds)
         log.info("Max concurrent reviews: %d", self.config.max_concurrent_reviews)
         log.info("Monitoring %d repos", len(self.config.repos))

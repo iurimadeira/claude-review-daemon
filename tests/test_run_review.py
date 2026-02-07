@@ -75,7 +75,7 @@ class TestFindExistingComment:
         assert "gh" in args
         assert "/repos/owner/repo/issues/7/comments" in args
         jq_arg = [a for a in args if "select(" in a][0]
-        assert "<!-- claude-ci-bridge:custom-skill -->" in jq_arg
+        assert "<!-- claude-review-daemon:custom-skill -->" in jq_arg
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ class TestUpsertComment:
         upsert_comment("owner/repo", 1, "review output", "review-pr", "abc1234def")
         mock_create.assert_called_once()
         body = mock_create.call_args[0][2]
-        assert "<!-- claude-ci-bridge:review-pr -->" in body
+        assert "<!-- claude-review-daemon:review-pr -->" in body
         assert "review output" in body
 
     @patch("run_review.subprocess.run")

@@ -1,6 +1,6 @@
 # Integration Guide
 
-How to add your project to claude-ci-bridge for automatic PR reviews.
+How to add your project to claude-review-daemon for automatic PR reviews.
 
 ## Overview
 
@@ -41,7 +41,7 @@ You may use the Task tool to spawn sub-agents from `.claude/agents/` as needed.
 ## 3. Clone the repo on the bridge server
 
 ```bash
-cd /opt/claude-ci-bridge/repos
+cd /opt/claude-review-daemon/repos
 git clone https://github.com/owner/repo owner_repo
 ```
 
@@ -49,7 +49,7 @@ The directory name must be `owner_repo` (slash replaced with underscore).
 
 ## 4. Add the repo to config.toml
 
-Edit `/opt/claude-ci-bridge/config.toml`:
+Edit `/opt/claude-review-daemon/config.toml`:
 
 ```toml
 [[repos]]
@@ -63,7 +63,7 @@ The daemon will pick up the change on the next poll cycle.
 
 ## 5. Verify
 
-1. **Check the daemon logs**: `journalctl -u claude-ci-bridge -f`
+1. **Check the daemon logs**: `journalctl -u claude-review-daemon -f`
 2. **Open a test PR** in your project
 3. **Wait for the review comment** (up to polling interval + review time)
 
@@ -71,8 +71,8 @@ The daemon will pick up the change on the next poll cycle.
 
 **No review triggers**:
 - Check the repo is in config.toml and enabled
-- Verify the repo is cloned: `ls /opt/claude-ci-bridge/repos/owner_repo`
-- Check logs for errors: `journalctl -u claude-ci-bridge | grep owner/repo`
+- Verify the repo is cloned: `ls /opt/claude-review-daemon/repos/owner_repo`
+- Check logs for errors: `journalctl -u claude-review-daemon | grep owner/repo`
 
 **Review fails with "Skill file not found"**:
 - Ensure `.claude/commands/<skill>.md` exists on the PR branch

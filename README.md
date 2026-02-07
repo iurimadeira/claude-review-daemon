@@ -1,4 +1,4 @@
-# claude-ci-bridge
+# claude-review-daemon
 
 A standalone tool that bridges GitHub PRs to Claude Max on a VPS, enabling any project to run Claude skills (e.g., PR review) via CI without API keys.
 
@@ -44,8 +44,8 @@ Since slash commands (`/review-pr`) don't work in headless `-p` mode, the bridge
 ### 1. Clone to the VPS
 
 ```bash
-git clone https://github.com/your-org/claude-ci-bridge /opt/claude-ci-bridge
-cd /opt/claude-ci-bridge
+git clone https://github.com/your-org/claude-review-daemon /opt/claude-review-daemon
+cd /opt/claude-review-daemon
 ```
 
 ### 2. Create directories
@@ -75,9 +75,9 @@ cp .env.example .env
 ### 5. Install systemd service
 
 ```bash
-sudo cp claude-ci-bridge.service /etc/systemd/system/
+sudo cp claude-review-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now claude-ci-bridge
+sudo systemctl enable --now claude-review-daemon
 ```
 
 See [docs/integration-guide.md](docs/integration-guide.md) for detailed setup and per-repo configuration.
