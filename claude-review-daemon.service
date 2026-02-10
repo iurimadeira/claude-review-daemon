@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=reviewer
+User=%USER%
 WorkingDirectory=/opt/claude-review-daemon
 ExecStart=/usr/bin/python3 /opt/claude-review-daemon/bridge.py
 Restart=always
