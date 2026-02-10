@@ -249,7 +249,7 @@ def main():
     parser.add_argument("--pr-number", required=True, type=int, help="PR number")
     parser.add_argument("--branch", required=True, help="PR branch name")
     parser.add_argument("--base-branch", required=True, help="Target branch")
-    parser.add_argument("--skill", default="pr-reviewer", help="Skill name to execute")
+    parser.add_argument("--skill", default="review-pr", help="Skill name to execute")
     parser.add_argument("--repo-dir", required=True, help="Base directory for repos")
     parser.add_argument("--head-sha", help="Head commit SHA for tracking")
     args = parser.parse_args()
