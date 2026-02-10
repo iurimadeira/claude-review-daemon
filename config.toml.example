@@ -14,11 +14,11 @@ repo_dir = "./repos"
 
 [[repos]]
 name = "owner/repo-name"    # GitHub repository (owner/repo format)
-skill = "review-pr"         # Skill file to use (from .claude/commands/<skill>.md)
+skill = "pr-reviewer"       # Skill name (resolves .claude/skills/<skill>/SKILL.md)
 branches = ["main"]         # Only review PRs targeting these branches (optional)
 enabled = true              # Set to false to temporarily disable
 
 [[repos]]
 name = "another-owner/another-repo"
-# skill defaults to "review-pr" if not specified
+# skill defaults to "pr-reviewer" if not specified
 # branches omitted = review PRs targeting any branch

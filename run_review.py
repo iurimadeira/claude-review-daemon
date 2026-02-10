@@ -72,9 +72,15 @@ def run_review(
         )
 
         # 4. Read the skill file
-        skill_path = os.path.join(worktree_path, ".claude", "commands", f"{skill}.md")
+        skill_path = os.path.join(worktree_path, ".claude", "skills", skill, "SKILL.md")
         if not os.path.isfile(skill_path):
-            error_msg = f"Skill file not found: `.claude/commands/{skill}.md`"
+            skill_path = os.path.join(worktree_path, ".claude", "commands", f"{skill}.md")
+        if not os.path.isfile(skill_path):
+            error_msg = (
+                f"Skill file not found. Tried:\n"
+                f"- `.claude/skills/{skill}/SKILL.md`\n"
+                f"- `.claude/commands/{skill}.md`"
+            )
             log.error(error_msg)
             upsert_comment(repo, pr_number, f"**Claude Review Daemon Error**\n\n{error_msg}", skill, head_sha)
             return
@@ -243,7 +249,7 @@ def main():
     parser.add_argument("--pr-number", required=True, type=int, help="PR number")
     parser.add_argument("--branch", required=True, help="PR branch name")
     parser.add_argument("--base-branch", required=True, help="Target branch")
-    parser.add_argument("--skill", default="review-pr", help="Skill name to execute")
+    parser.add_argument("--skill", default="pr-reviewer", help="Skill name to execute")
     parser.add_argument("--repo-dir", required=True, help="Base directory for repos")
     parser.add_argument("--head-sha", help="Head commit SHA for tracking")
     args = parser.parse_args()
