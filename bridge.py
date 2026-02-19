@@ -36,6 +36,12 @@ STATE_VERSION = 1
 
 
 @dataclass
+class ActiveReview:
+    proc: subprocess.Popen
+    head_sha: str
+
+
+@dataclass
 class RepoConfig:
     name: str
     skill: str = "review-pr"
@@ -203,18 +209,23 @@ class ReviewCoordinator:
         self.config = config
         self.state = state
         self.github = github
-        self.active_reviews: dict[str, subprocess.Popen] = {}
+        self.active_reviews: dict[str, ActiveReview] = {}
 
     def cleanup_finished_reviews(self):
         finished = []
-        for key, proc in self.active_reviews.items():
-            ret = proc.poll()
+        for key, review in self.active_reviews.items():
+            ret = review.proc.poll()
             if ret is not None:
-                repo, pr = key.rsplit("#", 1)
+                repo, pr_str = key.rsplit("#", 1)
+                pr_number = int(pr_str)
                 if ret == 0:
                     log.info("Review completed: %s", key)
+                    self.state.mark_reviewed(repo, pr_number, review.head_sha, status="completed")
+                elif ret < 0:
+                    log.info("Review killed (signal %d): %s", -ret, key)
                 else:
                     log.warning("Review failed with code %d: %s", ret, key)
+                    self.state.mark_reviewed(repo, pr_number, review.head_sha, status="failed")
                 finished.append(key)
 
         for key in finished:
@@ -226,6 +237,40 @@ class ReviewCoordinator:
 
     def is_reviewing(self, repo: str, pr_number: int) -> bool:
         return f"{repo}#{pr_number}" in self.active_reviews
+
+    def get_reviewing_sha(self, repo: str, pr_number: int) -> str | None:
+        key = f"{repo}#{pr_number}"
+        review = self.active_reviews.get(key)
+        return review.head_sha if review else None
+
+    def kill_review(self, repo: str, pr_number: int):
+        key = f"{repo}#{pr_number}"
+        review = self.active_reviews.get(key)
+        if review is None:
+            return
+
+        pid = review.proc.pid
+        log.info("Killing stale review %s (pid=%d)", key, pid)
+
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        try:
+            review.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("Review %s did not exit after SIGTERM, sending SIGKILL", key)
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                review.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.error("Review %s did not exit after SIGKILL", key)
+
+        del self.active_reviews[key]
 
     def start_review(self, repo: str, pr: dict, skill: str):
         pr_number = pr["number"]
@@ -256,7 +301,7 @@ class ReviewCoordinator:
             start_new_session=True,
         )
 
-        self.active_reviews[key] = proc
+        self.active_reviews[key] = ActiveReview(proc=proc, head_sha=head_sha)
 
 
 class Daemon:
@@ -311,7 +356,14 @@ class Daemon:
                 continue
 
             if self.coordinator.is_reviewing(repo, pr_number):
-                continue
+                reviewing_sha = self.coordinator.get_reviewing_sha(repo, pr_number)
+                if reviewing_sha == head_sha:
+                    continue
+                log.info(
+                    "New commit on %s#%d: %s -> %s, killing stale review",
+                    repo, pr_number, reviewing_sha[:8], head_sha[:8],
+                )
+                self.coordinator.kill_review(repo, pr_number)
 
             reviewed_sha = self.state.get_reviewed_sha(repo, pr_number)
             review_status = self.state.get_review_status(repo, pr_number)

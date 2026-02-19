@@ -9,12 +9,21 @@ import argparse
 import json
 import logging
 import os
+import signal as _signal
 import subprocess
 import sys
 import textwrap
 from datetime import datetime, timezone
 
 from slack_notify import notify_review_posted
+
+_killed = False
+
+
+def _handle_term(signum, frame):
+    global _killed
+    _killed = True
+    raise SystemExit(1)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +56,10 @@ def run_review(
     repo_dir: str,
     head_sha: str | None = None,
 ):
+    global _killed
+    _killed = False
+    _signal.signal(_signal.SIGTERM, _handle_term)
+
     repo_path = os.path.abspath(os.path.join(repo_dir, repo.replace("/", "_")))
     worktree_name = f"pr-{pr_number}"
     worktree_path = os.path.join(repo_path, "worktrees", worktree_name)
@@ -124,25 +137,28 @@ def run_review(
             output = "Review completed but produced no output."
 
         # 6. Post result as PR comment
-        comment_url = upsert_comment(repo, pr_number, output, skill, head_sha)
-        notify_review_posted(repo, pr_number, output, comment_url)
+        if not _killed:
+            comment_url = upsert_comment(repo, pr_number, output, skill, head_sha)
+            notify_review_posted(repo, pr_number, output, comment_url)
 
         log.info("Review complete for %s#%d", repo, pr_number)
 
     except subprocess.TimeoutExpired:
         log.error("Review timed out for %s#%d", repo, pr_number)
-        upsert_comment(
-            repo, pr_number,
-            "**Claude Review Daemon Error**\n\nReview timed out after 10 minutes.",
-            skill, head_sha,
-        )
+        if not _killed:
+            upsert_comment(
+                repo, pr_number,
+                "**Claude Review Daemon Error**\n\nReview timed out after 10 minutes.",
+                skill, head_sha,
+            )
     except Exception as e:
         log.exception("Review failed for %s#%d: %s", repo, pr_number, e)
-        upsert_comment(
-            repo, pr_number,
-            f"**Claude Review Daemon Error**\n\nReview failed: {type(e).__name__}",
-            skill, head_sha,
-        )
+        if not _killed:
+            upsert_comment(
+                repo, pr_number,
+                f"**Claude Review Daemon Error**\n\nReview failed: {type(e).__name__}",
+                skill, head_sha,
+            )
     finally:
         # 7. Clean up worktree
         if os.path.exists(worktree_path):

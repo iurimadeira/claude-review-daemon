@@ -1,14 +1,16 @@
 import json
+import signal
 import subprocess
 import time
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from urllib.error import HTTPError, URLError
 
 import pytest
 
 import bridge
 from bridge import (
+    ActiveReview,
     Config,
     Daemon,
     GitHubClient,
@@ -42,7 +44,7 @@ class TestRepoConfig:
 class TestConfig:
     def test_defaults(self):
         c = Config()
-        assert c.interval_seconds == 300
+        assert c.interval_seconds == 60
         assert c.max_concurrent_reviews == 3
         assert c.state_file == "./state.json"
         assert c.repo_dir == "./repos"
@@ -90,7 +92,7 @@ name = "owner/other"
         cfg = tmp_path / "config.toml"
         cfg.write_text('[[repos]]\nname = "o/r"\n')
         c = load_config(str(cfg))
-        assert c.interval_seconds == 300
+        assert c.interval_seconds == 60
         assert c.repos[0].name == "o/r"
         assert c.repos[0].skill == "review-pr"
 
@@ -98,7 +100,7 @@ name = "owner/other"
         cfg = tmp_path / "config.toml"
         cfg.write_text('[[repos]]\nname = "a/b"\n')
         c = load_config(str(cfg))
-        assert c.interval_seconds == 300
+        assert c.interval_seconds == 60
         assert c.repo_dir == "./repos"
 
     def test_enabled_false(self, tmp_path):
@@ -302,7 +304,10 @@ class TestReviewCoordinator:
         done_proc.poll.return_value = 0
         running_proc = MagicMock()
         running_proc.poll.return_value = None
-        coord.active_reviews = {"o/r#1": done_proc, "o/r#2": running_proc}
+        coord.active_reviews = {
+            "o/r#1": ActiveReview(proc=done_proc, head_sha="aaa"),
+            "o/r#2": ActiveReview(proc=running_proc, head_sha="bbb"),
+        }
         coord.cleanup_finished_reviews()
         assert "o/r#1" not in coord.active_reviews
         assert "o/r#2" in coord.active_reviews
@@ -315,12 +320,12 @@ class TestReviewCoordinator:
         coord = self._make_coordinator(max_concurrent=1)
         proc = MagicMock()
         proc.poll.return_value = None
-        coord.active_reviews["o/r#1"] = proc
+        coord.active_reviews["o/r#1"] = ActiveReview(proc=proc, head_sha="aaa")
         assert coord.can_start_review() is False
 
     def test_is_reviewing(self):
         coord = self._make_coordinator()
-        coord.active_reviews["o/r#5"] = MagicMock()
+        coord.active_reviews["o/r#5"] = ActiveReview(proc=MagicMock(), head_sha="aaa")
         assert coord.is_reviewing("o/r", 5) is True
         assert coord.is_reviewing("o/r", 6) is False
 
@@ -329,7 +334,9 @@ class TestReviewCoordinator:
         coord = self._make_coordinator()
         pr = sample_pr_payload(number=10, head_sha="deadbeefcafe")
         coord.start_review("o/r", pr, "review-pr")
-        assert "o/r#10" in coord.active_reviews
+        review = coord.active_reviews["o/r#10"]
+        assert review.head_sha == "deadbeefcafe"
+        assert review.proc is mock_popen.return_value
         coord.state.mark_reviewed.assert_called_once_with("o/r", 10, "deadbeefcafe", status="in_progress")
         coord.state.save.assert_called_once()
         args = mock_popen.call_args[0][0]
@@ -337,6 +344,68 @@ class TestReviewCoordinator:
         assert "o/r" in args
         assert "--head-sha" in args
         assert "deadbeefcafe" in args
+
+    def test_cleanup_marks_completed(self):
+        coord = self._make_coordinator()
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        coord.active_reviews["o/r#1"] = ActiveReview(proc=proc, head_sha="sha_ok")
+        coord.cleanup_finished_reviews()
+        coord.state.mark_reviewed.assert_called_once_with("o/r", 1, "sha_ok", status="completed")
+
+    def test_cleanup_marks_failed(self):
+        coord = self._make_coordinator()
+        proc = MagicMock()
+        proc.poll.return_value = 1
+        coord.active_reviews["o/r#1"] = ActiveReview(proc=proc, head_sha="sha_fail")
+        coord.cleanup_finished_reviews()
+        coord.state.mark_reviewed.assert_called_once_with("o/r", 1, "sha_fail", status="failed")
+
+    def test_cleanup_skips_killed(self):
+        coord = self._make_coordinator()
+        proc = MagicMock()
+        proc.poll.return_value = -signal.SIGTERM
+        coord.active_reviews["o/r#1"] = ActiveReview(proc=proc, head_sha="sha_killed")
+        coord.cleanup_finished_reviews()
+        coord.state.mark_reviewed.assert_not_called()
+        assert "o/r#1" not in coord.active_reviews
+
+    def test_get_reviewing_sha(self):
+        coord = self._make_coordinator()
+        coord.active_reviews["o/r#1"] = ActiveReview(proc=MagicMock(), head_sha="aaa111")
+        assert coord.get_reviewing_sha("o/r", 1) == "aaa111"
+        assert coord.get_reviewing_sha("o/r", 99) is None
+
+    @patch("bridge.os.killpg")
+    def test_kill_review(self, mock_killpg):
+        coord = self._make_coordinator()
+        proc = MagicMock()
+        proc.pid = 12345
+        coord.active_reviews["o/r#1"] = ActiveReview(proc=proc, head_sha="old_sha")
+        coord.kill_review("o/r", 1)
+        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+        proc.wait.assert_called_once_with(timeout=5)
+        assert "o/r#1" not in coord.active_reviews
+
+    @patch("bridge.os.killpg")
+    def test_kill_review_escalates_to_sigkill(self, mock_killpg):
+        coord = self._make_coordinator()
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="x", timeout=5), None]
+        coord.active_reviews["o/r#1"] = ActiveReview(proc=proc, head_sha="old_sha")
+        coord.kill_review("o/r", 1)
+        assert mock_killpg.call_args_list == [
+            call(12345, signal.SIGTERM),
+            call(12345, signal.SIGKILL),
+        ]
+        assert "o/r#1" not in coord.active_reviews
+
+    @patch("bridge.os.killpg")
+    def test_kill_review_noop_if_not_reviewing(self, mock_killpg):
+        coord = self._make_coordinator()
+        coord.kill_review("o/r", 99)
+        mock_killpg.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +456,35 @@ class TestDaemonPollRepo:
         daemon.poll_repo(sample_repo_config())
         daemon.state.set_etag.assert_called_with("owner/repo", '"new_etag"')
 
-    def test_pr_already_reviewing_skipped(self):
+    def test_pr_reviewing_same_sha_skipped(self):
         daemon = self._make_daemon()
-        pr = sample_pr_payload(number=1)
+        pr = sample_pr_payload(number=1, head_sha="abc1234def5678")
         daemon.github.get_open_prs.return_value = (200, [pr], None)
         daemon.coordinator.is_reviewing.return_value = True
+        daemon.coordinator.get_reviewing_sha.return_value = "abc1234def5678"
+        daemon.poll_repo(sample_repo_config())
+        daemon.coordinator.start_review.assert_not_called()
+        daemon.coordinator.kill_review.assert_not_called()
+
+    def test_pr_reviewing_different_sha_killed_and_restarted(self):
+        daemon = self._make_daemon()
+        pr = sample_pr_payload(number=1, head_sha="new_sha_123")
+        daemon.github.get_open_prs.return_value = (200, [pr], None)
+        daemon.coordinator.is_reviewing.return_value = True
+        daemon.coordinator.get_reviewing_sha.return_value = "old_sha_456"
+        daemon.state.get_reviewed_sha.return_value = None
+        daemon.coordinator.can_start_review.return_value = True
+        daemon.poll_repo(sample_repo_config())
+        daemon.coordinator.kill_review.assert_called_once_with("owner/repo", 1)
+        daemon.coordinator.start_review.assert_called_once()
+
+    def test_failed_review_not_retried(self):
+        daemon = self._make_daemon()
+        pr = sample_pr_payload(number=1, head_sha="same_sha")
+        daemon.github.get_open_prs.return_value = (200, [pr], None)
+        daemon.state.get_reviewed_sha.return_value = "same_sha"
+        daemon.state.get_review_status.return_value = "failed"
+        daemon.coordinator.is_reviewing.return_value = False
         daemon.poll_repo(sample_repo_config())
         daemon.coordinator.start_review.assert_not_called()
 

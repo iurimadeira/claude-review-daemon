@@ -26,7 +26,7 @@ def sample_repo_config(name="owner/repo", skill="review-pr", branches=None, enab
 
 def sample_config(**overrides):
     defaults = dict(
-        interval_seconds=300,
+        interval_seconds=60,
         max_concurrent_reviews=3,
         state_file="./state.json",
         repo_dir="./repos",
