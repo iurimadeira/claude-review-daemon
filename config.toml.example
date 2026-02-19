@@ -2,7 +2,7 @@
 # Copy to config.toml and customize for your setup.
 
 [polling]
-interval_seconds = 300      # 5 minutes between polls
+interval_seconds = 60       # 1 minute between polls
 max_concurrent_reviews = 3  # Max simultaneous review processes
 
 [paths]

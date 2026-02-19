@@ -94,7 +94,9 @@ def run_review(
         prompt = (
             f"Execute the following skill for PR #{pr_number} "
             f"(branch `{branch}` targeting `{base_branch}`).\n\n"
-            f"The repository is `{repo}`. You are in the PR's worktree."
+            f"The repository is `{repo}`. You are in the PR's worktree.\n\n"
+            f"IMPORTANT: You have a maximum of 10 minutes to complete this review. "
+            f"Be focused and concise. Prioritize the most impactful feedback."
         )
 
         result = subprocess.run(
@@ -108,7 +110,7 @@ def run_review(
             cwd=worktree_path,
             capture_output=True,
             text=True,
-            timeout=3600,  # 1 hour max for the full review
+            timeout=600,  # 10 minutes max for the full review
         )
 
         if result.returncode != 0:
@@ -131,7 +133,7 @@ def run_review(
         log.error("Review timed out for %s#%d", repo, pr_number)
         upsert_comment(
             repo, pr_number,
-            "**Claude Review Daemon Error**\n\nReview timed out after 1 hour.",
+            "**Claude Review Daemon Error**\n\nReview timed out after 10 minutes.",
             skill, head_sha,
         )
     except Exception as e:

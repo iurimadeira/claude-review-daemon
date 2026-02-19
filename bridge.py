@@ -45,7 +45,7 @@ class RepoConfig:
 
 @dataclass
 class Config:
-    interval_seconds: int = 300
+    interval_seconds: int = 60
     max_concurrent_reviews: int = 3
     state_file: str = "./state.json"
     repo_dir: str = "./repos"
@@ -69,7 +69,7 @@ def load_config(path: str) -> Config:
         ))
 
     return Config(
-        interval_seconds=polling.get("interval_seconds", 300),
+        interval_seconds=polling.get("interval_seconds", 60),
         max_concurrent_reviews=polling.get("max_concurrent_reviews", 3),
         state_file=paths.get("state_file", "./state.json"),
         repo_dir=paths.get("repo_dir", "./repos"),
