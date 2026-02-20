@@ -1,3 +1,4 @@
+import json
 import subprocess
 from unittest.mock import MagicMock, call, mock_open, patch
 
@@ -5,17 +6,20 @@ import pytest
 
 import run_review
 from run_review import (
+    ClaudeResult,
     MAX_COMMENT_LENGTH,
     _create_comment,
     find_existing_comment,
     main,
+    parse_stream_json,
     run,
     run_review as do_review,
+    select_review_output,
     truncate_output,
     upsert_comment,
 )
 
-from tests.helpers import FROZEN_NOW, make_completed_process
+from tests.helpers import FROZEN_NOW, make_completed_process, make_mock_popen
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +178,109 @@ class TestRunWrapper:
 
 
 # ---------------------------------------------------------------------------
+# parse_stream_json
+# ---------------------------------------------------------------------------
+
+def _assistant_event(text):
+    return json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+
+def _result_event(result="", cost_usd=None, num_turns=None, session_id=None, subtype=None):
+    e = {"type": "result", "result": result}
+    if cost_usd is not None:
+        e["cost_usd"] = cost_usd
+    if num_turns is not None:
+        e["num_turns"] = num_turns
+    if session_id is not None:
+        e["session_id"] = session_id
+    if subtype is not None:
+        e["subtype"] = subtype
+    return json.dumps(e)
+
+
+class TestParseStreamJson:
+    def test_single_assistant_and_result(self):
+        lines = [_assistant_event("Hello review"), _result_event("Final result", cost_usd=0.05, num_turns=3, session_id="s1")]
+        r = parse_stream_json(iter(lines))
+        assert r.result_text == "Final result"
+        assert r.all_assistant_text == ["Hello review"]
+        assert r.cost_usd == 0.05
+        assert r.num_turns == 3
+        assert r.session_id == "s1"
+        assert r.is_error is False
+
+    def test_multi_turn_only_text_blocks(self):
+        tool_event = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "read"}]}})
+        lines = [_assistant_event("First"), tool_event, _assistant_event("Second"), _result_event("done")]
+        r = parse_stream_json(iter(lines))
+        assert r.all_assistant_text == ["First", "Second"]
+
+    def test_malformed_lines_skipped(self):
+        lines = ["not json", _assistant_event("ok"), "{bad json", _result_event("done")]
+        r = parse_stream_json(iter(lines))
+        assert r.all_assistant_text == ["ok"]
+        assert r.result_text == "done"
+
+    def test_empty_stream(self):
+        r = parse_stream_json(iter([]))
+        assert r.result_text == ""
+        assert r.all_assistant_text == []
+        assert r.cost_usd is None
+        assert r.is_error is False
+
+    def test_error_result(self):
+        lines = [_result_event("err msg", subtype="error")]
+        r = parse_stream_json(iter(lines))
+        assert r.is_error is True
+        assert r.result_text == "err msg"
+
+    def test_blank_lines_ignored(self):
+        lines = ["", "  ", _assistant_event("text"), "", _result_event("done")]
+        r = parse_stream_json(iter(lines))
+        assert r.all_assistant_text == ["text"]
+
+    def test_empty_text_blocks_ignored(self):
+        event = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "  "}]}})
+        lines = [event, _assistant_event("real"), _result_event("done")]
+        r = parse_stream_json(iter(lines))
+        assert r.all_assistant_text == ["real"]
+
+
+# ---------------------------------------------------------------------------
+# select_review_output
+# ---------------------------------------------------------------------------
+
+class TestSelectReviewOutput:
+    def test_substantial_result_used_as_is(self):
+        r = ClaudeResult(result_text="## Review\nLooks good!", all_assistant_text=["msg1"], cost_usd=None, num_turns=None, is_error=False, session_id=None)
+        assert select_review_output(r) == "## Review\nLooks good!"
+
+    def test_stub_detected_falls_back(self):
+        r = ClaudeResult(result_text="Review complete. All findings are in the consolidated report above.", all_assistant_text=["## Review\nBig report here"], cost_usd=None, num_turns=None, is_error=False, session_id=None)
+        assert select_review_output(r) == "## Review\nBig report here"
+
+    def test_empty_result_uses_assistant_text(self):
+        r = ClaudeResult(result_text="", all_assistant_text=["msg1", "msg2"], cost_usd=None, num_turns=None, is_error=False, session_id=None)
+        assert select_review_output(r) == "msg1\n\nmsg2"
+
+    def test_short_text_without_stub_patterns(self):
+        r = ClaudeResult(result_text="LGTM, no issues found.", all_assistant_text=["other"], cost_usd=None, num_turns=None, is_error=False, session_id=None)
+        assert select_review_output(r) == "LGTM, no issues found."
+
+    def test_both_empty_returns_empty(self):
+        r = ClaudeResult(result_text="", all_assistant_text=[], cost_usd=None, num_turns=None, is_error=False, session_id=None)
+        assert select_review_output(r) == ""
+
+    def test_stub_without_assistant_text_uses_result(self):
+        r = ClaudeResult(result_text="Review complete.", all_assistant_text=[], cost_usd=None, num_turns=None, is_error=False, session_id=None)
+        assert select_review_output(r) == "Review complete."
+
+    def test_long_text_with_stub_pattern_not_triggered(self):
+        long_review = "Review complete. " + "x" * 600
+        r = ClaudeResult(result_text=long_review, all_assistant_text=["other"], cost_usd=None, num_turns=None, is_error=False, session_id=None)
+        assert select_review_output(r) == long_review
+
+
+# ---------------------------------------------------------------------------
 # run_review orchestration
 # ---------------------------------------------------------------------------
 
@@ -188,26 +295,34 @@ class TestRunReviewOrchestration:
         head_sha="abc1234def5678",
     )
 
+    @staticmethod
+    def _stream_lines(result_text="Review result", assistant_texts=None, cost_usd=0.01, num_turns=2):
+        lines = []
+        for text in (assistant_texts or []):
+            lines.append(_assistant_event(text))
+        lines.append(_result_event(result_text, cost_usd=cost_usd, num_turns=num_turns, session_id="s1"))
+        return lines
+
     @patch("run_review.upsert_comment")
-    @patch("run_review.subprocess.run")
+    @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill content"))
-    def test_happy_path(self, mock_isfile, mock_exists, mock_run_wrap, mock_subproc, mock_upsert):
-        mock_subproc.return_value = make_completed_process(stdout="Review result")
+    def test_happy_path(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+        mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines("Review result"))
         do_review(**self.COMMON_KWARGS)
         mock_upsert.assert_called_once()
         assert "Review result" in mock_upsert.call_args[0][2]
 
     @patch("run_review.upsert_comment")
-    @patch("run_review.subprocess.run")
+    @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=True)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_stale_worktree_removed(self, mock_isfile, mock_exists, mock_run_wrap, mock_subproc, mock_upsert):
-        mock_subproc.return_value = make_completed_process(stdout="ok")
+    def test_stale_worktree_removed(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+        mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines("ok"))
         do_review(**self.COMMON_KWARGS)
         remove_calls = [c for c in mock_run_wrap.call_args_list if "worktree" in str(c) and "remove" in str(c)]
         assert len(remove_calls) >= 1
@@ -222,49 +337,57 @@ class TestRunReviewOrchestration:
         assert "Skill file not found" in body
 
     @patch("run_review.upsert_comment")
-    @patch("run_review.subprocess.run")
+    @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_claude_nonzero_exit(self, mock_isfile, mock_exists, mock_run_wrap, mock_subproc, mock_upsert):
-        mock_subproc.return_value = make_completed_process(returncode=1, stdout="partial", stderr="error detail")
+    def test_claude_nonzero_exit(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+        mock_popen.return_value = make_mock_popen(
+            stdout_lines=self._stream_lines("partial"),
+            returncode=1,
+            stderr="error detail",
+        )
         do_review(**self.COMMON_KWARGS)
         body = mock_upsert.call_args[0][2]
         assert "partial" in body or "error detail" in body
 
     @patch("run_review.upsert_comment")
-    @patch("run_review.subprocess.run")
+    @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_claude_empty_output(self, mock_isfile, mock_exists, mock_run_wrap, mock_subproc, mock_upsert):
-        mock_subproc.return_value = make_completed_process(stdout="   \n  ")
+    def test_claude_empty_output(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+        mock_popen.return_value = make_mock_popen(stdout_lines=[_result_event("")])
         do_review(**self.COMMON_KWARGS)
         body = mock_upsert.call_args[0][2]
         assert "produced no output" in body
 
     @patch("run_review.upsert_comment")
-    @patch("run_review.subprocess.run")
+    @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_timeout(self, mock_isfile, mock_exists, mock_run_wrap, mock_subproc, mock_upsert):
-        mock_subproc.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=3600)
+    def test_timeout(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+        mock_proc = make_mock_popen(
+            stdout_lines=[],
+            wait_side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=600),
+        )
+        mock_popen.return_value = mock_proc
         do_review(**self.COMMON_KWARGS)
         body = mock_upsert.call_args[0][2]
         assert "timed out" in body
 
     @patch("run_review.upsert_comment")
-    @patch("run_review.subprocess.run")
+    @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_generic_exception(self, mock_isfile, mock_exists, mock_run_wrap, mock_subproc, mock_upsert):
-        mock_subproc.side_effect = RuntimeError("unexpected")
+    def test_generic_exception(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+        mock_popen.side_effect = RuntimeError("unexpected")
         do_review(**self.COMMON_KWARGS)
         body = mock_upsert.call_args[0][2]
         assert "RuntimeError" in body

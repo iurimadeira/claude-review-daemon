@@ -13,6 +13,7 @@ import signal as _signal
 import subprocess
 import sys
 import textwrap
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from slack_notify import notify_review_posted
@@ -31,6 +32,95 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("run-review")
+
+
+@dataclass
+class ClaudeResult:
+    result_text: str
+    all_assistant_text: list[str]
+    cost_usd: float | None
+    num_turns: int | None
+    is_error: bool
+    session_id: str | None
+
+
+def parse_stream_json(stream) -> ClaudeResult:
+    all_assistant_text = []
+    result_text = ""
+    cost_usd = None
+    num_turns = None
+    is_error = False
+    session_id = None
+
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("Skipping malformed stream-json line: %s", line[:200])
+            continue
+
+        event_type = event.get("type")
+        if event_type == "assistant":
+            message = event.get("message", {})
+            for block in message.get("content", []):
+                if block.get("type") == "text":
+                    text = block.get("text", "").strip()
+                    if text:
+                        all_assistant_text.append(text)
+        elif event_type == "result":
+            result_text = event.get("result", "")
+            cost_usd = event.get("cost_usd")
+            num_turns = event.get("num_turns")
+            is_error = event.get("subtype") == "error"
+            session_id = event.get("session_id")
+
+    return ClaudeResult(
+        result_text=result_text,
+        all_assistant_text=all_assistant_text,
+        cost_usd=cost_usd,
+        num_turns=num_turns,
+        is_error=is_error,
+        session_id=session_id,
+    )
+
+
+_STUB_PATTERNS = [
+    "review complete",
+    "all findings",
+    "findings are in",
+    "consolidated report above",
+    "report above",
+    "posted above",
+    "summary above",
+]
+_STUB_MAX_LENGTH = 500
+
+
+def select_review_output(result: ClaudeResult) -> str:
+    text = result.result_text.strip()
+
+    if not text and result.all_assistant_text:
+        return "\n\n".join(result.all_assistant_text)
+
+    if not text:
+        return ""
+
+    is_stub = (
+        len(text) < _STUB_MAX_LENGTH
+        and any(p in text.lower() for p in _STUB_PATTERNS)
+    )
+
+    if is_stub and result.all_assistant_text:
+        log.info(
+            "Result looks like a summary stub (%d chars), using full assistant output (%d messages)",
+            len(text), len(result.all_assistant_text),
+        )
+        return "\n\n".join(result.all_assistant_text)
+
+    return text
 
 MAX_COMMENT_LENGTH = 65000  # GitHub comment limit is 65536
 COMMENT_MARKER_TEMPLATE = "<!-- claude-review-daemon:{skill} -->"
@@ -109,29 +199,56 @@ def run_review(
             f"(branch `{branch}` targeting `{base_branch}`).\n\n"
             f"The repository is `{repo}`. You are in the PR's worktree.\n\n"
             f"IMPORTANT: You have a maximum of 10 minutes to complete this review. "
-            f"Be focused and concise. Prioritize the most impactful feedback."
+            f"Be focused and concise. Prioritize the most impactful feedback.\n\n"
+            f"CRITICAL: Your FINAL message will be posted as a GitHub PR comment. "
+            f"It MUST contain the complete review with all findings. "
+            f"Do not refer to previous messages or say 'above' — your final message must be self-contained."
         )
 
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [
                 "claude",
                 "-p", prompt,
+                "--output-format", "stream-json",
                 "--append-system-prompt", skill_content,
                 "--dangerously-skip-permissions",
                 "--max-turns", "50",
             ],
             cwd=worktree_path,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=600,  # 10 minutes max for the full review
         )
 
-        if result.returncode != 0:
-            log.error("Claude exited with code %d", result.returncode)
-            log.error("stderr: %s", result.stderr[:2000] if result.stderr else "(empty)")
-            output = result.stdout or result.stderr or "Claude exited with no output"
+        try:
+            try:
+                claude_result = parse_stream_json(proc.stdout)
+                proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        stderr_output = proc.stderr.read() if proc.stderr else ""
+
+        if proc.returncode != 0:
+            log.error("Claude exited with code %d", proc.returncode)
+            log.error("stderr: %s", stderr_output[:2000] if stderr_output else "(empty)")
+
+        if claude_result.cost_usd is not None:
+            log.info(
+                "Claude: cost=$%.4f turns=%s session=%s",
+                claude_result.cost_usd, claude_result.num_turns, claude_result.session_id,
+            )
+
+        if claude_result.is_error or proc.returncode != 0:
+            output = select_review_output(claude_result) or stderr_output or "Claude exited with no output"
         else:
-            output = result.stdout
+            output = select_review_output(claude_result)
 
         if not output.strip():
             output = "Review completed but produced no output."
