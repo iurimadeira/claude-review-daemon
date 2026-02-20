@@ -209,6 +209,7 @@ def run_review(
             [
                 "claude",
                 "-p", prompt,
+                "--verbose",
                 "--output-format", "stream-json",
                 "--append-system-prompt", skill_content,
                 "--dangerously-skip-permissions",
