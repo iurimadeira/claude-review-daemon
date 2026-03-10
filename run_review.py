@@ -185,7 +185,7 @@ def run_review(
                 f"- `.claude/commands/{skill}.md`"
             )
             log.error(error_msg)
-            upsert_comment(repo, pr_number, f"**Claude Review Daemon Error**\n\n{error_msg}", skill, head_sha)
+            post_comment(repo, pr_number, f"**Claude Review Daemon Error**\n\n{error_msg}", skill, head_sha)
             return
 
         with open(skill_path) as f:
@@ -256,7 +256,7 @@ def run_review(
 
         # 6. Post result as PR comment
         if not _killed:
-            comment_url = upsert_comment(repo, pr_number, output, skill, head_sha)
+            comment_url = post_comment(repo, pr_number, output, skill, head_sha)
             notify_review_posted(repo, pr_number, output, comment_url)
 
         log.info("Review complete for %s#%d", repo, pr_number)
@@ -264,7 +264,7 @@ def run_review(
     except subprocess.TimeoutExpired:
         log.error("Review timed out for %s#%d", repo, pr_number)
         if not _killed:
-            upsert_comment(
+            post_comment(
                 repo, pr_number,
                 "**Claude Review Daemon Error**\n\nReview timed out after 10 minutes.",
                 skill, head_sha,
@@ -272,7 +272,7 @@ def run_review(
     except Exception as e:
         log.exception("Review failed for %s#%d: %s", repo, pr_number, e)
         if not _killed:
-            upsert_comment(
+            post_comment(
                 repo, pr_number,
                 f"**Claude Review Daemon Error**\n\nReview failed: {type(e).__name__}",
                 skill, head_sha,
@@ -294,7 +294,7 @@ def truncate_output(output: str) -> str:
     return output[: MAX_COMMENT_LENGTH - len(truncation_notice)] + truncation_notice
 
 
-def find_existing_comment(repo: str, pr_number: int, skill: str) -> int | None:
+def find_existing_comments(repo: str, pr_number: int, skill: str) -> list[dict]:
     marker = COMMENT_MARKER_TEMPLATE.format(skill=skill)
     try:
         result = subprocess.run(
@@ -302,22 +302,45 @@ def find_existing_comment(repo: str, pr_number: int, skill: str) -> int | None:
                 "gh", "api",
                 f"/repos/{repo}/issues/{pr_number}/comments",
                 "--paginate", "-q",
-                f'[.[] | select(.body | startswith("{marker}"))][0].id',
+                f'[.[] | select(.body | startswith("{marker}")) | {{id: .id, node_id: .node_id}}]',
             ],
             capture_output=True,
             text=True,
             timeout=60,
         )
         if result.returncode == 0 and result.stdout.strip():
-            comment_id = int(result.stdout.strip())
-            log.info("Found existing comment %d for skill=%s", comment_id, skill)
-            return comment_id
+            comments = json.loads(result.stdout)
+            log.info("Found %d existing comment(s) for skill=%s", len(comments), skill)
+            return comments
     except Exception:
-        log.warning("Failed to search for existing comment", exc_info=True)
-    return None
+        log.warning("Failed to search for existing comments", exc_info=True)
+    return []
 
 
-def upsert_comment(
+def minimize_comment(node_id: str) -> bool:
+    query = (
+        "mutation($id: ID!) {"
+        "  minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) {"
+        "    minimizedComment { isMinimized }"
+        "  }"
+        "}"
+    )
+    try:
+        result = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"id={node_id}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return True
+        log.warning("Failed to minimize comment %s: %s", node_id, result.stderr)
+    except Exception:
+        log.warning("Failed to minimize comment %s", node_id, exc_info=True)
+    return False
+
+
+def post_comment(
     repo: str,
     pr_number: int,
     body: str,
@@ -335,26 +358,10 @@ def upsert_comment(
     full_body = f"{marker}\n{body}{footer}"
     full_body = truncate_output(full_body)
 
-    existing_id = find_existing_comment(repo, pr_number, skill)
-    if existing_id:
-        log.info("Updating comment %d on %s#%d", existing_id, repo, pr_number)
-        result = subprocess.run(
-            [
-                "gh", "api", "--method", "PATCH",
-                f"/repos/{repo}/issues/comments/{existing_id}",
-                "-f", f"body={full_body}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0:
-            log.info("Comment updated successfully")
-            try:
-                return json.loads(result.stdout).get("html_url")
-            except (json.JSONDecodeError, AttributeError):
-                return None
-        log.warning("Failed to update comment %d: %s — falling back to create", existing_id, result.stderr)
+    old_comments = find_existing_comments(repo, pr_number, skill)
+    for comment in old_comments:
+        if minimize_comment(comment["node_id"]):
+            log.info("Minimized old review comment %s", comment["id"])
 
     return _create_comment(repo, pr_number, full_body)
 

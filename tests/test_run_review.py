@@ -9,14 +9,15 @@ from run_review import (
     ClaudeResult,
     MAX_COMMENT_LENGTH,
     _create_comment,
-    find_existing_comment,
+    find_existing_comments,
     main,
+    minimize_comment,
     parse_stream_json,
     run,
     run_review as do_review,
     select_review_output,
     truncate_output,
-    upsert_comment,
+    post_comment,
 )
 
 from tests.helpers import FROZEN_NOW, make_completed_process, make_mock_popen
@@ -47,39 +48,74 @@ class TestTruncateOutput:
 
 
 # ---------------------------------------------------------------------------
-# find_existing_comment
+# find_existing_comments
 # ---------------------------------------------------------------------------
 
-class TestFindExistingComment:
+class TestFindExistingComments:
     @patch("run_review.subprocess.run")
-    def test_comment_found(self, mock_run):
-        mock_run.return_value = make_completed_process(stdout="12345\n")
-        assert find_existing_comment("owner/repo", 1, "review-pr") == 12345
+    def test_comments_found(self, mock_run):
+        mock_run.return_value = make_completed_process(
+            stdout='[{"id": 12345, "node_id": "IC_abc"}]\n'
+        )
+        result = find_existing_comments("owner/repo", 1, "review-pr")
+        assert result == [{"id": 12345, "node_id": "IC_abc"}]
 
     @patch("run_review.subprocess.run")
-    def test_empty_stdout_returns_none(self, mock_run):
+    def test_multiple_comments_found(self, mock_run):
+        mock_run.return_value = make_completed_process(
+            stdout='[{"id": 100, "node_id": "IC_a"}, {"id": 200, "node_id": "IC_b"}]\n'
+        )
+        result = find_existing_comments("owner/repo", 1, "review-pr")
+        assert len(result) == 2
+
+    @patch("run_review.subprocess.run")
+    def test_empty_stdout_returns_empty_list(self, mock_run):
         mock_run.return_value = make_completed_process(stdout="")
-        assert find_existing_comment("owner/repo", 1, "review-pr") is None
+        assert find_existing_comments("owner/repo", 1, "review-pr") == []
 
     @patch("run_review.subprocess.run")
-    def test_nonzero_returncode_returns_none(self, mock_run):
-        mock_run.return_value = make_completed_process(returncode=1, stdout="12345")
-        assert find_existing_comment("owner/repo", 1, "review-pr") is None
+    def test_nonzero_returncode_returns_empty_list(self, mock_run):
+        mock_run.return_value = make_completed_process(returncode=1, stdout="[]")
+        assert find_existing_comments("owner/repo", 1, "review-pr") == []
 
     @patch("run_review.subprocess.run")
-    def test_exception_returns_none(self, mock_run):
+    def test_exception_returns_empty_list(self, mock_run):
         mock_run.side_effect = OSError("boom")
-        assert find_existing_comment("owner/repo", 1, "review-pr") is None
+        assert find_existing_comments("owner/repo", 1, "review-pr") == []
 
     @patch("run_review.subprocess.run")
     def test_command_includes_marker_in_jq(self, mock_run):
         mock_run.return_value = make_completed_process(stdout="")
-        find_existing_comment("owner/repo", 7, "custom-skill")
+        find_existing_comments("owner/repo", 7, "custom-skill")
         args = mock_run.call_args[0][0]
         assert "gh" in args
         assert "/repos/owner/repo/issues/7/comments" in args
         jq_arg = [a for a in args if "select(" in a][0]
         assert "<!-- claude-review-daemon:custom-skill -->" in jq_arg
+
+
+# ---------------------------------------------------------------------------
+# minimize_comment
+# ---------------------------------------------------------------------------
+
+class TestMinimizeComment:
+    @patch("run_review.subprocess.run")
+    def test_success(self, mock_run):
+        mock_run.return_value = make_completed_process()
+        assert minimize_comment("IC_abc") is True
+        args = mock_run.call_args[0][0]
+        assert "graphql" in args
+        assert any("IC_abc" in str(a) for a in args)
+
+    @patch("run_review.subprocess.run")
+    def test_failure_returns_false(self, mock_run):
+        mock_run.return_value = make_completed_process(returncode=1, stderr="err")
+        assert minimize_comment("IC_abc") is False
+
+    @patch("run_review.subprocess.run")
+    def test_exception_returns_false(self, mock_run):
+        mock_run.side_effect = OSError("boom")
+        assert minimize_comment("IC_abc") is False
 
 
 # ---------------------------------------------------------------------------
@@ -104,55 +140,62 @@ class TestCreateComment:
 
 
 # ---------------------------------------------------------------------------
-# upsert_comment
+# post_comment
 # ---------------------------------------------------------------------------
 
-class TestUpsertComment:
+class TestPostComment:
     @patch("run_review._create_comment")
-    @patch("run_review.find_existing_comment", return_value=None)
-    def test_no_existing_creates_new(self, mock_find, mock_create, frozen_now):
-        upsert_comment("owner/repo", 1, "review output", "review-pr", "abc1234def")
+    @patch("run_review.minimize_comment")
+    @patch("run_review.find_existing_comments", return_value=[])
+    def test_no_existing_creates_new(self, mock_find, mock_minimize, mock_create, frozen_now):
+        post_comment("owner/repo", 1, "review output", "review-pr", "abc1234def")
+        mock_minimize.assert_not_called()
         mock_create.assert_called_once()
         body = mock_create.call_args[0][2]
         assert "<!-- claude-review-daemon:review-pr -->" in body
         assert "review output" in body
 
-    @patch("run_review.subprocess.run")
-    @patch("run_review.find_existing_comment", return_value=999)
-    def test_existing_updates_via_patch(self, mock_find, mock_run, frozen_now):
-        mock_run.return_value = make_completed_process()
-        upsert_comment("owner/repo", 1, "updated", "review-pr")
-        args = mock_run.call_args[0][0]
-        assert "PATCH" in args
-        assert "/repos/owner/repo/issues/comments/999" in args
-
     @patch("run_review._create_comment")
-    @patch("run_review.subprocess.run")
-    @patch("run_review.find_existing_comment", return_value=999)
-    def test_patch_failure_falls_back_to_create(self, mock_find, mock_run, mock_create, frozen_now):
-        mock_run.return_value = make_completed_process(returncode=1, stderr="fail")
-        upsert_comment("owner/repo", 1, "body", "review-pr")
+    @patch("run_review.minimize_comment", return_value=True)
+    @patch("run_review.find_existing_comments")
+    def test_minimizes_old_comments_before_creating(self, mock_find, mock_minimize, mock_create, frozen_now):
+        mock_find.return_value = [
+            {"id": 100, "node_id": "IC_a"},
+            {"id": 200, "node_id": "IC_b"},
+        ]
+        post_comment("owner/repo", 1, "new review", "review-pr")
+        assert mock_minimize.call_count == 2
+        mock_minimize.assert_any_call("IC_a")
+        mock_minimize.assert_any_call("IC_b")
         mock_create.assert_called_once()
 
     @patch("run_review._create_comment")
-    @patch("run_review.find_existing_comment", return_value=None)
+    @patch("run_review.minimize_comment", return_value=False)
+    @patch("run_review.find_existing_comments")
+    def test_minimize_failure_does_not_block_create(self, mock_find, mock_minimize, mock_create, frozen_now):
+        mock_find.return_value = [{"id": 100, "node_id": "IC_a"}]
+        post_comment("owner/repo", 1, "body", "review-pr")
+        mock_create.assert_called_once()
+
+    @patch("run_review._create_comment")
+    @patch("run_review.find_existing_comments", return_value=[])
     def test_footer_includes_sha_when_provided(self, mock_find, mock_create, frozen_now):
-        upsert_comment("owner/repo", 1, "body", "review-pr", "abc1234def5678")
+        post_comment("owner/repo", 1, "body", "review-pr", "abc1234def5678")
         body = mock_create.call_args[0][2]
         assert "`abc1234`" in body
 
     @patch("run_review._create_comment")
-    @patch("run_review.find_existing_comment", return_value=None)
+    @patch("run_review.find_existing_comments", return_value=[])
     def test_footer_timestamp_only_when_no_sha(self, mock_find, mock_create, frozen_now):
-        upsert_comment("owner/repo", 1, "body", "review-pr", None)
+        post_comment("owner/repo", 1, "body", "review-pr", None)
         body = mock_create.call_args[0][2]
         assert "Reviewed commit" not in body
         assert "2025-06-15 12:00 UTC" in body
 
     @patch("run_review._create_comment")
-    @patch("run_review.find_existing_comment", return_value=None)
+    @patch("run_review.find_existing_comments", return_value=[])
     def test_long_body_truncated(self, mock_find, mock_create, frozen_now):
-        upsert_comment("owner/repo", 1, "x" * (MAX_COMMENT_LENGTH + 500), "review-pr")
+        post_comment("owner/repo", 1, "x" * (MAX_COMMENT_LENGTH + 500), "review-pr")
         body = mock_create.call_args[0][2]
         assert len(body) <= MAX_COMMENT_LENGTH
 
@@ -303,110 +346,110 @@ class TestRunReviewOrchestration:
         lines.append(_result_event(result_text, cost_usd=cost_usd, num_turns=num_turns, session_id="s1"))
         return lines
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill content"))
-    def test_happy_path(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+    def test_happy_path(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
         mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines("Review result"))
         do_review(**self.COMMON_KWARGS)
-        mock_upsert.assert_called_once()
-        assert "Review result" in mock_upsert.call_args[0][2]
+        mock_post.assert_called_once()
+        assert "Review result" in mock_post.call_args[0][2]
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=True)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_stale_worktree_removed(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+    def test_stale_worktree_removed(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
         mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines("ok"))
         do_review(**self.COMMON_KWARGS)
         remove_calls = [c for c in mock_run_wrap.call_args_list if "worktree" in str(c) and "remove" in str(c)]
         assert len(remove_calls) >= 1
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=False)
-    def test_skill_not_found(self, mock_isfile, mock_exists, mock_run_wrap, mock_upsert):
+    def test_skill_not_found(self, mock_isfile, mock_exists, mock_run_wrap, mock_post):
         do_review(**self.COMMON_KWARGS)
-        body = mock_upsert.call_args[0][2]
+        body = mock_post.call_args[0][2]
         assert "Skill file not found" in body
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_claude_nonzero_exit(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+    def test_claude_nonzero_exit(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
         mock_popen.return_value = make_mock_popen(
             stdout_lines=self._stream_lines("partial"),
             returncode=1,
             stderr="error detail",
         )
         do_review(**self.COMMON_KWARGS)
-        body = mock_upsert.call_args[0][2]
+        body = mock_post.call_args[0][2]
         assert "partial" in body or "error detail" in body
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_claude_empty_output(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+    def test_claude_empty_output(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
         mock_popen.return_value = make_mock_popen(stdout_lines=[_result_event("")])
         do_review(**self.COMMON_KWARGS)
-        body = mock_upsert.call_args[0][2]
+        body = mock_post.call_args[0][2]
         assert "produced no output" in body
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_timeout(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+    def test_timeout(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
         mock_proc = make_mock_popen(
             stdout_lines=[],
             wait_side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=600),
         )
         mock_popen.return_value = mock_proc
         do_review(**self.COMMON_KWARGS)
-        body = mock_upsert.call_args[0][2]
+        body = mock_post.call_args[0][2]
         assert "timed out" in body
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_generic_exception(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_upsert):
+    def test_generic_exception(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
         mock_popen.side_effect = RuntimeError("unexpected")
         do_review(**self.COMMON_KWARGS)
-        body = mock_upsert.call_args[0][2]
+        body = mock_post.call_args[0][2]
         assert "RuntimeError" in body
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.run")
     @patch("run_review.os.path.exists")
     @patch("run_review.os.path.isfile", return_value=False)
-    def test_finally_always_cleans_up(self, mock_isfile, mock_exists_fn, mock_run_wrap, mock_upsert):
+    def test_finally_always_cleans_up(self, mock_isfile, mock_exists_fn, mock_run_wrap, mock_post):
         mock_exists_fn.side_effect = [False, True]
         do_review(**self.COMMON_KWARGS)
         cleanup_calls = [c for c in mock_run_wrap.call_args_list if "worktree" in str(c) and "remove" in str(c)]
         assert len(cleanup_calls) >= 1
 
-    @patch("run_review.upsert_comment")
+    @patch("run_review.post_comment")
     @patch("run_review.run")
     @patch("run_review.os.path.exists")
     @patch("run_review.os.path.isfile", return_value=False)
-    def test_cleanup_failure_swallowed(self, mock_isfile, mock_exists_fn, mock_run_wrap, mock_upsert):
+    def test_cleanup_failure_swallowed(self, mock_isfile, mock_exists_fn, mock_run_wrap, mock_post):
         mock_exists_fn.side_effect = [False, True]
         mock_run_wrap.side_effect = [
             make_completed_process(),  # git fetch
