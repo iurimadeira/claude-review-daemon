@@ -8,10 +8,15 @@ import run_review
 from run_review import (
     ClaudeResult,
     MAX_COMMENT_LENGTH,
+    ReviewOutput,
     _create_comment,
+    create_review,
+    fetch_existing_review_comments,
     find_existing_comments,
+    format_review_as_comment,
     main,
     minimize_comment,
+    parse_review_json,
     parse_stream_json,
     run,
     run_review as do_review,
@@ -201,6 +206,37 @@ class TestPostComment:
 
 
 # ---------------------------------------------------------------------------
+# fetch_existing_review_comments
+# ---------------------------------------------------------------------------
+
+class TestFetchExistingReviewComments:
+    @patch("run_review.subprocess.run")
+    def test_returns_comments(self, mock_run):
+        mock_run.return_value = make_completed_process(
+            stdout='[{"path": "a.py", "line": 10, "body": "Fix this"}]\n'
+        )
+        result = fetch_existing_review_comments("owner/repo", 1)
+        assert result == [{"path": "a.py", "line": 10, "body": "Fix this"}]
+        cmd = mock_run.call_args[0][0]
+        assert "/repos/owner/repo/pulls/1/comments" in cmd
+
+    @patch("run_review.subprocess.run")
+    def test_empty_returns_empty_list(self, mock_run):
+        mock_run.return_value = make_completed_process(stdout="")
+        assert fetch_existing_review_comments("owner/repo", 1) == []
+
+    @patch("run_review.subprocess.run")
+    def test_error_returns_empty_list(self, mock_run):
+        mock_run.return_value = make_completed_process(returncode=1)
+        assert fetch_existing_review_comments("owner/repo", 1) == []
+
+    @patch("run_review.subprocess.run")
+    def test_exception_returns_empty_list(self, mock_run):
+        mock_run.side_effect = OSError("boom")
+        assert fetch_existing_review_comments("owner/repo", 1) == []
+
+
+# ---------------------------------------------------------------------------
 # run wrapper
 # ---------------------------------------------------------------------------
 
@@ -324,6 +360,203 @@ class TestSelectReviewOutput:
 
 
 # ---------------------------------------------------------------------------
+# parse_review_json
+# ---------------------------------------------------------------------------
+
+class TestParseReviewJson:
+    def test_valid_json(self):
+        text = json.dumps({
+            "summary": "Looks good overall",
+            "event": "APPROVE",
+            "comments": [{"path": "src/main.py", "line": 10, "body": "Nice work"}],
+        })
+        result = parse_review_json(text)
+        assert result is not None
+        assert result.summary == "Looks good overall"
+        assert result.event == "APPROVE"
+        assert result.comments == [{"path": "src/main.py", "line": 10, "body": "Nice work"}]
+
+    def test_json_in_code_fence(self):
+        text = '```json\n{"summary": "LGTM", "event": "APPROVE", "comments": []}\n```'
+        result = parse_review_json(text)
+        assert result is not None
+        assert result.summary == "LGTM"
+
+    def test_json_with_surrounding_text(self):
+        text = 'Here is my review:\n{"summary": "Found issues", "event": "REQUEST_CHANGES", "comments": []}\nDone.'
+        result = parse_review_json(text)
+        assert result is not None
+        assert result.event == "REQUEST_CHANGES"
+
+    def test_invalid_json_returns_none(self):
+        assert parse_review_json("not json at all") is None
+
+    def test_missing_summary_returns_none(self):
+        text = json.dumps({"event": "COMMENT", "comments": []})
+        assert parse_review_json(text) is None
+
+    def test_empty_summary_returns_none(self):
+        text = json.dumps({"summary": "  ", "event": "COMMENT", "comments": []})
+        assert parse_review_json(text) is None
+
+    def test_invalid_event_coerced_to_request_changes(self):
+        text = json.dumps({"summary": "Review", "event": "INVALID", "comments": []})
+        result = parse_review_json(text)
+        assert result is not None
+        assert result.event == "REQUEST_CHANGES"
+
+    def test_missing_event_defaults_to_request_changes(self):
+        text = json.dumps({"summary": "Review", "comments": []})
+        result = parse_review_json(text)
+        assert result is not None
+        assert result.event == "REQUEST_CHANGES"
+
+    def test_comment_event_coerced_to_request_changes(self):
+        text = json.dumps({"summary": "Review", "event": "COMMENT", "comments": []})
+        result = parse_review_json(text)
+        assert result is not None
+        assert result.event == "REQUEST_CHANGES"
+
+    def test_comments_with_missing_fields_filtered(self):
+        text = json.dumps({
+            "summary": "Review",
+            "event": "COMMENT",
+            "comments": [
+                {"path": "a.py", "line": 1, "body": "ok"},
+                {"path": "b.py", "line": 2},  # missing body
+                {"path": "c.py", "body": "no line"},  # missing line
+                {"body": "no path"},  # missing path
+                {"path": "d.py", "line": 3, "body": "also ok"},
+            ],
+        })
+        result = parse_review_json(text)
+        assert result is not None
+        assert len(result.comments) == 2
+        assert result.comments[0]["path"] == "a.py"
+        assert result.comments[1]["path"] == "d.py"
+
+    def test_empty_text_returns_none(self):
+        assert parse_review_json("") is None
+
+    def test_no_braces_returns_none(self):
+        assert parse_review_json("just plain text without braces") is None
+
+    def test_null_line_filtered_out(self):
+        text = json.dumps({
+            "summary": "Review",
+            "event": "REQUEST_CHANGES",
+            "comments": [
+                {"path": "a.py", "line": None, "body": "no line"},
+                {"path": "b.py", "line": 10, "body": "has line"},
+            ],
+        })
+        result = parse_review_json(text)
+        assert len(result.comments) == 1
+        assert result.comments[0]["path"] == "b.py"
+
+    def test_zero_or_negative_line_filtered_out(self):
+        text = json.dumps({
+            "summary": "Review",
+            "event": "APPROVE",
+            "comments": [
+                {"path": "a.py", "line": 0, "body": "zero"},
+                {"path": "b.py", "line": -1, "body": "negative"},
+                {"path": "c.py", "line": 1, "body": "valid"},
+            ],
+        })
+        result = parse_review_json(text)
+        assert len(result.comments) == 1
+        assert result.comments[0]["path"] == "c.py"
+
+    def test_line_coerced_to_int(self):
+        text = json.dumps({
+            "summary": "Review",
+            "event": "COMMENT",
+            "comments": [{"path": "a.py", "line": "42", "body": "ok"}],
+        })
+        result = parse_review_json(text)
+        assert result.comments[0]["line"] == 42
+
+
+# ---------------------------------------------------------------------------
+# format_review_as_comment
+# ---------------------------------------------------------------------------
+
+class TestFormatReviewAsComment:
+    def test_summary_only(self):
+        review = ReviewOutput(summary="All good", event="APPROVE", comments=[])
+        assert format_review_as_comment(review) == "All good"
+
+    def test_with_comments(self):
+        review = ReviewOutput(
+            summary="Found issues",
+            event="REQUEST_CHANGES",
+            comments=[
+                {"path": "src/main.py", "line": 10, "body": "Fix this"},
+                {"path": "src/utils.py", "line": 25, "body": "Also fix this"},
+            ],
+        )
+        result = format_review_as_comment(review)
+        assert "Found issues" in result
+        assert "**`src/main.py` (line 10)**" in result
+        assert "Fix this" in result
+        assert "**`src/utils.py` (line 25)**" in result
+
+
+# ---------------------------------------------------------------------------
+# create_review
+# ---------------------------------------------------------------------------
+
+class TestCreateReview:
+    @patch("run_review.subprocess.run")
+    def test_success(self, mock_run, frozen_now):
+        mock_run.return_value = make_completed_process(
+            stdout='{"html_url": "https://github.com/owner/repo/pull/1#pullrequestreview-123"}'
+        )
+        review = ReviewOutput(
+            summary="LGTM",
+            event="APPROVE",
+            comments=[{"path": "a.py", "line": 10, "body": "Nice"}],
+        )
+        url = create_review("owner/repo", 1, "abc1234def5678", review, "review-pr")
+        assert url == "https://github.com/owner/repo/pull/1#pullrequestreview-123"
+
+    @patch("run_review.subprocess.run")
+    def test_payload_structure(self, mock_run, frozen_now):
+        mock_run.return_value = make_completed_process(stdout='{"html_url": "https://example.com"}')
+        review = ReviewOutput(
+            summary="Review",
+            event="REQUEST_CHANGES",
+            comments=[{"path": "b.py", "line": 5, "body": "Issue"}],
+        )
+        create_review("owner/repo", 42, "deadbeef12345678", review, "review-pr")
+        args = mock_run.call_args
+        cmd = args[0][0]
+        assert "repos/owner/repo/pulls/42/reviews" in cmd
+        assert "--method" in cmd
+        assert "POST" in cmd
+        assert "--input" in cmd
+        payload = json.loads(args[1]["input"])
+        assert payload["commit_id"] == "deadbeef12345678"
+        assert payload["event"] == "REQUEST_CHANGES"
+        assert len(payload["comments"]) == 1
+        assert payload["comments"][0]["side"] == "RIGHT"
+        assert "<!-- claude-review-daemon:review-pr -->" in payload["body"]
+
+    @patch("run_review.subprocess.run")
+    def test_failure_returns_none(self, mock_run, frozen_now):
+        mock_run.return_value = make_completed_process(returncode=1, stderr="error")
+        review = ReviewOutput(summary="Review", event="REQUEST_CHANGES", comments=[])
+        assert create_review("owner/repo", 1, "abc123", review, "review-pr") is None
+
+    @patch("run_review.subprocess.run")
+    def test_invalid_json_response(self, mock_run, frozen_now):
+        mock_run.return_value = make_completed_process(stdout="not json")
+        review = ReviewOutput(summary="Review", event="REQUEST_CHANGES", comments=[])
+        assert create_review("owner/repo", 1, "abc123", review, "review-pr") is None
+
+
+# ---------------------------------------------------------------------------
 # run_review orchestration
 # ---------------------------------------------------------------------------
 
@@ -338,6 +571,12 @@ class TestRunReviewOrchestration:
         head_sha="abc1234def5678",
     )
 
+    REVIEW_JSON = json.dumps({
+        "summary": "Looks good overall",
+        "event": "APPROVE",
+        "comments": [{"path": "src/main.py", "line": 10, "body": "Nice work"}],
+    })
+
     @staticmethod
     def _stream_lines(result_text="Review result", assistant_texts=None, cost_usd=0.01, num_turns=2):
         lines = []
@@ -346,29 +585,104 @@ class TestRunReviewOrchestration:
         lines.append(_result_event(result_text, cost_usd=cost_usd, num_turns=num_turns, session_id="s1"))
         return lines
 
-    @patch("run_review.post_comment")
+    @patch("run_review.notify_review_posted")
+    @patch("run_review.create_review", return_value="https://github.com/owner/repo/pull/42#review")
+    @patch("run_review.find_existing_comments", return_value=[])
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill content"))
-    def test_happy_path(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
+    def test_happy_path_review(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen,
+                                mock_fetch, mock_find, mock_create, mock_notify):
+        mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines(self.REVIEW_JSON))
+        do_review(**self.COMMON_KWARGS)
+        mock_create.assert_called_once()
+        assert mock_create.call_args[0][2] == "abc1234def5678"  # head_sha
+        mock_notify.assert_called_once()
+        assert "Looks good overall" in mock_notify.call_args[0][2]
+
+    @patch("run_review.notify_review_posted")
+    @patch("run_review.create_review", return_value=None)
+    @patch("run_review.post_comment", return_value="https://example.com")
+    @patch("run_review.find_existing_comments", return_value=[])
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
+    @patch("run_review.subprocess.Popen")
+    @patch("run_review.run")
+    @patch("run_review.os.path.exists", return_value=False)
+    @patch("run_review.os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data="skill"))
+    def test_review_creation_failure_falls_back_to_comment(
+        self, mock_isfile, mock_exists, mock_run_wrap, mock_popen,
+        mock_fetch, mock_find, mock_post, mock_create, mock_notify,
+    ):
+        mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines(self.REVIEW_JSON))
+        do_review(**self.COMMON_KWARGS)
+        mock_create.assert_called_once()
+        mock_post.assert_called_once()
+        body = mock_post.call_args[0][2]
+        assert "Looks good overall" in body
+        assert "src/main.py" in body
+
+    @patch("run_review.post_comment")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
+    @patch("run_review.subprocess.Popen")
+    @patch("run_review.run")
+    @patch("run_review.os.path.exists", return_value=False)
+    @patch("run_review.os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data="skill content"))
+    def test_non_json_output_uses_post_comment(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_fetch, mock_post):
         mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines("Review result"))
         do_review(**self.COMMON_KWARGS)
         mock_post.assert_called_once()
         assert "Review result" in mock_post.call_args[0][2]
 
+    @patch("run_review.notify_review_posted")
+    @patch("run_review.minimize_comment", return_value=True)
+    @patch("run_review.find_existing_comments")
+    @patch("run_review.create_review", return_value="https://example.com")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
+    @patch("run_review.subprocess.Popen")
+    @patch("run_review.run")
+    @patch("run_review.os.path.exists", return_value=False)
+    @patch("run_review.os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data="skill"))
+    def test_review_path_minimizes_old_comments(
+        self, mock_isfile, mock_exists, mock_run_wrap, mock_popen,
+        mock_fetch, mock_create, mock_find, mock_minimize, mock_notify,
+    ):
+        mock_find.return_value = [{"id": 100, "node_id": "IC_a"}]
+        mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines(self.REVIEW_JSON))
+        do_review(**self.COMMON_KWARGS)
+        mock_minimize.assert_called_once_with("IC_a")
+        mock_create.assert_called_once()
+
     @patch("run_review.post_comment")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=True)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_stale_worktree_removed(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
+    def test_stale_worktree_removed(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_fetch, mock_post):
         mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines("ok"))
         do_review(**self.COMMON_KWARGS)
         remove_calls = [c for c in mock_run_wrap.call_args_list if "worktree" in str(c) and "remove" in str(c)]
         assert len(remove_calls) >= 1
+
+    @patch("run_review.post_comment")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
+    @patch("run_review.subprocess.Popen")
+    @patch("run_review.run")
+    @patch("run_review.os.path.exists", return_value=False)
+    @patch("run_review.os.path.isfile", return_value=True)
+    @patch("builtins.open", mock_open(read_data="skill"))
+    def test_no_head_sha_uses_post_comment(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_fetch, mock_post):
+        mock_popen.return_value = make_mock_popen(stdout_lines=self._stream_lines(self.REVIEW_JSON))
+        kwargs = {**self.COMMON_KWARGS, "head_sha": None}
+        do_review(**kwargs)
+        mock_post.assert_called_once()
 
     @patch("run_review.post_comment")
     @patch("run_review.run")
@@ -380,12 +694,13 @@ class TestRunReviewOrchestration:
         assert "Skill file not found" in body
 
     @patch("run_review.post_comment")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_claude_nonzero_exit(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
+    def test_claude_nonzero_exit(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_fetch, mock_post):
         mock_popen.return_value = make_mock_popen(
             stdout_lines=self._stream_lines("partial"),
             returncode=1,
@@ -396,24 +711,26 @@ class TestRunReviewOrchestration:
         assert "partial" in body or "error detail" in body
 
     @patch("run_review.post_comment")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_claude_empty_output(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
+    def test_claude_empty_output(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_fetch, mock_post):
         mock_popen.return_value = make_mock_popen(stdout_lines=[_result_event("")])
         do_review(**self.COMMON_KWARGS)
         body = mock_post.call_args[0][2]
         assert "produced no output" in body
 
     @patch("run_review.post_comment")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_timeout(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
+    def test_timeout(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_fetch, mock_post):
         mock_proc = make_mock_popen(
             stdout_lines=[],
             wait_side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=600),
@@ -424,12 +741,13 @@ class TestRunReviewOrchestration:
         assert "timed out" in body
 
     @patch("run_review.post_comment")
+    @patch("run_review.fetch_existing_review_comments", return_value=[])
     @patch("run_review.subprocess.Popen")
     @patch("run_review.run")
     @patch("run_review.os.path.exists", return_value=False)
     @patch("run_review.os.path.isfile", return_value=True)
     @patch("builtins.open", mock_open(read_data="skill"))
-    def test_generic_exception(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_post):
+    def test_generic_exception(self, mock_isfile, mock_exists, mock_run_wrap, mock_popen, mock_fetch, mock_post):
         mock_popen.side_effect = RuntimeError("unexpected")
         do_review(**self.COMMON_KWARGS)
         body = mock_post.call_args[0][2]

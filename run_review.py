@@ -12,7 +12,6 @@ import os
 import signal as _signal
 import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -42,6 +41,16 @@ class ClaudeResult:
     num_turns: int | None
     is_error: bool
     session_id: str | None
+
+
+@dataclass
+class ReviewOutput:
+    summary: str
+    event: str
+    comments: list[dict]
+
+
+_VALID_REVIEW_EVENTS = {"APPROVE", "REQUEST_CHANGES"}
 
 
 def parse_stream_json(stream) -> ClaudeResult:
@@ -122,8 +131,75 @@ def select_review_output(result: ClaudeResult) -> str:
 
     return text
 
+def parse_review_json(text: str) -> ReviewOutput | None:
+    raw = text.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        raw = "\n".join(lines)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    try:
+        data = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    summary = data.get("summary")
+    event = data.get("event", "REQUEST_CHANGES")
+    comments = data.get("comments", [])
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    if event not in _VALID_REVIEW_EVENTS:
+        event = "REQUEST_CHANGES"
+    valid_comments = []
+    for c in comments:
+        if not isinstance(c, dict) or "path" not in c or "body" not in c:
+            continue
+        line = c.get("line")
+        try:
+            line = int(line)
+        except (TypeError, ValueError):
+            continue
+        if line < 1:
+            continue
+        valid_comments.append(
+            {"path": str(c["path"]), "line": int(line), "body": str(c["body"])}
+        )
+    return ReviewOutput(summary=summary.strip(), event=event, comments=valid_comments)
+
+
+def format_review_as_comment(review: ReviewOutput) -> str:
+    parts = [review.summary]
+    for c in review.comments:
+        parts.append(f"\n**`{c['path']}` (line {c['line']})**\n{c['body']}")
+    return "\n".join(parts)
+
+
 MAX_COMMENT_LENGTH = 65000  # GitHub comment limit is 65536
 COMMENT_MARKER_TEMPLATE = "<!-- claude-review-daemon:{skill} -->"
+
+
+def fetch_existing_review_comments(repo: str, pr_number: int) -> list[dict]:
+    try:
+        result = subprocess.run(
+            [
+                "gh", "api",
+                f"/repos/{repo}/pulls/{pr_number}/comments",
+                "--paginate", "-q",
+                '[.[] | {path: .path, line: (.line // .original_line), body: .body}]',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            comments = json.loads(result.stdout)
+            log.info("Found %d existing review comment(s) on PR", len(comments))
+            return comments
+    except Exception:
+        log.warning("Failed to fetch existing review comments", exc_info=True)
+    return []
 
 
 def run(cmd: list[str], cwd: str | None = None, capture: bool = False) -> subprocess.CompletedProcess:
@@ -193,16 +269,43 @@ def run_review(
 
         log.info("Loaded skill file: %s (%d bytes)", skill_path, len(skill_content))
 
-        # 5. Run Claude with skill injection
+        # 5. Fetch existing review comments to avoid duplicates
+        existing_comments = fetch_existing_review_comments(repo, pr_number)
+        existing_context = ""
+        if existing_comments:
+            lines = []
+            for ec in existing_comments:
+                path = ec.get("path", "?")
+                line = ec.get("line", "?")
+                body = ec.get("body", "").replace("\n", " ")[:200]
+                lines.append(f"- {path}:{line} — {body}")
+            existing_context = (
+                f"\n\nEXISTING REVIEW COMMENTS (do NOT repeat these findings):\n"
+                + "\n".join(lines)
+            )
+
+        # 6. Run Claude with skill injection
         prompt = (
             f"Execute the following skill for PR #{pr_number} "
             f"(branch `{branch}` targeting `{base_branch}`).\n\n"
             f"The repository is `{repo}`. You are in the PR's worktree.\n\n"
             f"IMPORTANT: You have a maximum of 10 minutes to complete this review. "
             f"Be focused and concise. Prioritize the most impactful feedback.\n\n"
-            f"CRITICAL: Your FINAL message will be posted as a GitHub PR comment. "
-            f"It MUST contain the complete review with all findings. "
-            f"Do not refer to previous messages or say 'above' — your final message must be self-contained."
+            f"CRITICAL OUTPUT FORMAT: Your final message MUST be a JSON object "
+            f"(raw, no markdown code fences) with this structure:\n"
+            f'{{"summary": "...", "event": "APPROVE", '
+            f'"comments": [{{"path": "src/file.py", "line": 42, "body": "Your finding"}}]}}\n\n'
+            f"Rules:\n"
+            f"- summary: A concise, high-level opinion about the PR as a whole. "
+            f"Express whether the approach is sound, the code quality, and your overall impression. "
+            f"Do NOT list specific findings here — those go in the comments array.\n"
+            f"- event: MUST be APPROVE or REQUEST_CHANGES. "
+            f"Use APPROVE if the code is good (minor suggestions OK). "
+            f"Use REQUEST_CHANGES if there are issues to fix before merging.\n"
+            f"- comments: Each specific finding as an inline comment. "
+            f"EVERY comment MUST have a numeric line number (integer, not null) "
+            f"from the actual file. path is relative to repo root. Markdown supported in body."
+            f"{existing_context}"
         )
 
         proc = subprocess.Popen(
@@ -254,10 +357,24 @@ def run_review(
         if not output.strip():
             output = "Review completed but produced no output."
 
-        # 6. Post result as PR comment
+        # 7. Post result as PR review or comment
         if not _killed:
-            comment_url = post_comment(repo, pr_number, output, skill, head_sha)
-            notify_review_posted(repo, pr_number, output, comment_url)
+            review = parse_review_json(output) if not (claude_result.is_error or proc.returncode != 0) else None
+            if review and head_sha:
+                old_comments = find_existing_comments(repo, pr_number, skill)
+                for comment in old_comments:
+                    if minimize_comment(comment["node_id"]):
+                        log.info("Minimized old review comment %s", comment["id"])
+                review_url = create_review(repo, pr_number, head_sha, review, skill)
+                if review_url:
+                    notify_review_posted(repo, pr_number, review.summary, review_url)
+                else:
+                    formatted = format_review_as_comment(review)
+                    url = post_comment(repo, pr_number, formatted, skill, head_sha)
+                    notify_review_posted(repo, pr_number, review.summary, url)
+            else:
+                url = post_comment(repo, pr_number, output, skill, head_sha)
+                notify_review_posted(repo, pr_number, output, url)
 
         log.info("Review complete for %s#%d", repo, pr_number)
 
@@ -278,7 +395,7 @@ def run_review(
                 skill, head_sha,
             )
     finally:
-        # 7. Clean up worktree
+        # 8. Clean up worktree
         if os.path.exists(worktree_path):
             log.info("Cleaning up worktree: %s", worktree_path)
             try:
@@ -338,6 +455,51 @@ def minimize_comment(node_id: str) -> bool:
     except Exception:
         log.warning("Failed to minimize comment %s", node_id, exc_info=True)
     return False
+
+
+def create_review(
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    review: ReviewOutput,
+    skill: str,
+) -> str | None:
+    marker = COMMENT_MARKER_TEMPLATE.format(skill=skill)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    body = f"{marker}\n{review.summary}\n\n---\n*Reviewed commit: `{head_sha[:7]}` at {now}*"
+
+    payload = {
+        "commit_id": head_sha,
+        "body": body,
+        "event": review.event,
+        "comments": [
+            {"path": c["path"], "line": c["line"], "side": "RIGHT", "body": c["body"]}
+            for c in review.comments
+        ],
+    }
+
+    log.info(
+        "Creating review on %s#%d (event=%s, %d inline comments)",
+        repo, pr_number, review.event, len(review.comments),
+    )
+    result = subprocess.run(
+        [
+            "gh", "api", f"repos/{repo}/pulls/{pr_number}/reviews",
+            "--method", "POST", "--input", "-",
+        ],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        log.error("Failed to create review: %s", result.stderr)
+        return None
+    log.info("Review created successfully")
+    try:
+        return json.loads(result.stdout).get("html_url")
+    except (json.JSONDecodeError, KeyError):
+        return None
 
 
 def post_comment(
