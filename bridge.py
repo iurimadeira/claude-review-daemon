@@ -296,8 +296,8 @@ class ReviewCoordinator:
                 "--repo-dir", self.config.repo_dir,
                 "--head-sha", head_sha,
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
             start_new_session=True,
         )
 
